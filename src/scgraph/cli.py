@@ -112,17 +112,67 @@ def _scan(a: argparse.Namespace) -> int:
             seen = scanned.setdefault(root, source_imports.scan_sources(root))
             for finding in r.alerts:
                 finding.imported = source_imports.classify(finding.ecosystem, finding.path, seen)
-    if a.reachability:
+    if a.reachability or a.deep:
         from .scan import reachability
+        from .symbols import dataset as symbol_data
 
-        called: dict[Path, set[str]] = {}
+        try:
+            inferred = symbol_data.load()  # offline; zero model calls at scan time
+        except symbol_data.DatasetError as e:
+            print(f"scgraph: ignoring the inferred-symbol dataset: {e}", file=sys.stderr)
+            inferred = symbol_data.Index([])
+        deep = None
+        if a.deep:
+            from .symbols.deep import DeepAnalyzer
+
+            deep = DeepAnalyzer()
+        called: dict[tuple[Path, str], set[str]] = {}
         for r in results:
             root = Path(r.path).resolve().parent
-            names = called.setdefault(root, reachability.scan_python(root))
             for finding in r.alerts:
+                key = (root, finding.ecosystem)
+                if key not in called:  # one source scan per project and language
+                    scan = (
+                        reachability.scan_js
+                        if finding.ecosystem == "npm"
+                        else reachability.scan_python
+                    )
+                    called[key] = scan(root)
+                names = called[key]
+                if finding.symbols:
+                    finding.symbols_source = "osv"
+                elif finding.ecosystem in ("PyPI", "npm"):
+                    rec = inferred.get(sorted(finding.all_ids()), package=finding.package)
+                    if rec is not None:
+                        finding.symbols = [rec["symbol"], *rec.get("entry_points", [])]
+                        finding.symbols_source = "inferred"
+                        ev = rec.get("evidence") or {}
+                        finding.symbol_evidence = ev.get("fix") or "code search"
+                        if deep is not None and finding.path and len(finding.path) > 2:
+                            prop, note = deep.analyze(finding.path, rec)
+                            if prop is None:
+                                finding.symbols = []
+                                finding.symbol_evidence += f" ({note})"
+                            else:
+                                finding.reach_hops = len(finding.path) - 1
+                                finding.symbols = prop.names
+                                if not prop.reached:
+                                    finding.symbol_evidence += (
+                                        f" (no call from {prop.broke_at} into the next package)"
+                                    )
                 finding.reachability = reachability.classify(
-                    finding.ecosystem, finding.path, finding.symbols, names
+                    finding.ecosystem,
+                    finding.path,
+                    finding.symbols,
+                    names,
+                    deep=finding.reach_hops > 1,
                 )
+                if (
+                    finding.reach_hops > 1
+                    and not finding.symbols
+                    and "(no call" in (finding.symbol_evidence)
+                ):
+                    finding.reachability = "not_called"  # analysed, and no path reaches it
     fmt = {
         "text": lambda: render.to_text(results, verbose=a.verbose),
         "json": lambda: render.to_json(results),
@@ -151,6 +201,32 @@ def _scan(a: argparse.Namespace) -> int:
     level = FAIL_LEVELS[a.fail_on]
     worst = [int(f.priority[1]) for r in results for f in r.alerts]
     return 1 if level >= 0 and any(w <= level for w in worst) else 0
+
+
+def _ask(a: argparse.Namespace) -> int:
+    import contextlib
+    import io
+    import json
+
+    from .scan import ask
+
+    argv = ["scan", *a.paths, "-f", "json", "--reachability", "--fail-on", "never"]
+    if a.deep:
+        argv.append("--deep")
+    for flag, val in (("--offline", a.offline),):
+        if val:
+            argv += [flag, val]
+    argv += [
+        x for x, on in (("--no-signals", a.no_signals), ("--no-registry", a.no_registry)) if on
+    ]
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        code = main(argv)
+    if code not in (0, 1):
+        print("scgraph: the scan failed, so there is nothing to answer from", file=sys.stderr)
+        return 2
+    print(ask.render(ask.answer(a.question, json.loads(buf.getvalue()))))
+    return 0
 
 
 def _diff(a: argparse.Namespace) -> int:
@@ -379,10 +455,26 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument(
         "--reachability",
         action="store_true",
-        help="mark Python alerts whose advisory names functions your source references",
+        help="mark Python alerts whose vulnerable functions your source references (from the "
+        "advisory, else from the inferred-symbol dataset; never suppresses)",
+    )
+    s.add_argument(
+        "--deep",
+        action="store_true",
+        help="also follow transitive dependency paths through released source (implies "
+        "--reachability; downloads each package on the path once, then caches)",
     )
     s.add_argument("-v", "--verbose", action="store_true", help="list every abstention")
     s.set_defaults(fn=_scan)
+
+    q = sub.add_parser("ask", help="ask a question about your scan; every answer cites its source")
+    q.add_argument("question")
+    q.add_argument("paths", nargs="*", default=["."], help="lockfiles or directories (default: .)")
+    q.add_argument("--offline", metavar="DIR")
+    q.add_argument("--no-signals", action="store_true")
+    q.add_argument("--no-registry", action="store_true")
+    q.add_argument("--deep", action="store_true")
+    q.set_defaults(fn=_ask)
 
     d = sub.add_parser("diff", help="what did this change introduce? (new alerts vs a git ref)")
     d.add_argument("paths", nargs="*", help="lockfiles or directories (default: .)")
@@ -438,6 +530,10 @@ def build_parser() -> argparse.ArgumentParser:
     o.add_argument("ecosystems", nargs="+", help="npm pypi cargo go maven rubygems packagist nuget")
     o.add_argument("--dir", default="osv")
     o.set_defaults(fn=_fetch_osv)
+
+    from .symbols.cli import add_parser as add_symbols
+
+    add_symbols(sub)
     return ap
 
 
